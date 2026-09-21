@@ -141,6 +141,18 @@ def main():
     p_doctor.add_argument("--json", action="store_true",
                           help="Output machine-readable JSON instead of the text report")
 
+    # ── intelligence ──
+    p_intelligence = sub.add_parser(
+        "intelligence",
+        help="Collect, cluster, verify, and rank live cross-platform signals",
+    )
+    p_intelligence.add_argument("--window", default="24h", help="Discovery window, for example 24h or 6h (default: 24h)")
+    p_intelligence.add_argument("--top", type=int, default=30, help="Number of canonical social-buzz topics to report (default: 30)")
+    p_intelligence.add_argument("--multilingual", action="store_true", help="Preserve and translate non-English signals when possible")
+    p_intelligence.add_argument("--verify", action="store_true", help="Read returned source pages through Agent-Reach web verification")
+    p_intelligence.add_argument("--global-timeout", type=int, default=300, help="Overall collection budget in seconds (default: 300)")
+    p_intelligence.add_argument("--output", default="output", help="Directory for JSON, raw signals, clusters, and Markdown report")
+
     # ── uninstall ──
     p_uninstall = sub.add_parser("uninstall", help="Remove all Agent Reach config, tokens, and skill files")
     p_uninstall.add_argument("--dry-run", action="store_true",
@@ -237,6 +249,8 @@ def main():
 
     if args.command == "doctor":
         _cmd_doctor(args)
+    elif args.command == "intelligence":
+        _cmd_intelligence(args)
     elif args.command == "check-update":
         _cmd_check_update()
     elif args.command == "watch":
@@ -258,6 +272,29 @@ def main():
 
 
 # ── Command handlers ────────────────────────────────
+
+
+def _cmd_intelligence(args):
+    """Run the live collection/ranking pipeline without exposing credentials."""
+    import re
+
+    from agent_reach.intelligence import run_intelligence
+
+    match = re.fullmatch(r"(\d+(?:\.\d+)?)h", str(args.window).strip().lower())
+    if not match:
+        raise SystemExit("--window must use hours, for example 24h or 6h")
+    try:
+        run = run_intelligence(
+            window_hours=float(match.group(1)),
+            top_n=args.top,
+            multilingual=args.multilingual,
+            verify=args.verify,
+            output_dir=args.output,
+            global_timeout_seconds=args.global_timeout,
+        )
+    except Exception as exc:  # noqa: BLE001 — CLI boundary should be concise
+        raise SystemExit(f"intelligence collection failed: {exc}") from exc
+    print(run.report)
 
 
 def _cmd_install(args):

@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """Web — any URL via Jina Reader. Always available."""
 
+import time
 import urllib.request
 
 from agent_reach.utils.url import normalize_public_http_url
@@ -10,6 +11,27 @@ from .base import Channel
 _UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
 _MAX_RESPONSE_BYTES = 5 * 1024 * 1024
 _ANTIBOT_SCAN_BYTES = 4096
+_READ_TIMEOUT_SECONDS = 8
+
+
+def _read_limited(response, *, timeout: int) -> bytes:
+    deadline = time.monotonic() + timeout
+    chunks: list[bytes] = []
+    total = 0
+    while total <= _MAX_RESPONSE_BYTES:
+        if time.monotonic() >= deadline:
+            raise TimeoutError(f"Jina Reader response exceeded {timeout}s wall-clock limit")
+        chunk = response.read(min(64 * 1024, _MAX_RESPONSE_BYTES + 1 - total))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        total += len(chunk)
+    body = b"".join(chunks)
+    if len(body) > _MAX_RESPONSE_BYTES:
+        raise ValueError(
+            f"Jina Reader response exceeds {_MAX_RESPONSE_BYTES} byte limit"
+        )
+    return body
 
 
 def _is_antibot_page(body: bytes) -> bool:
@@ -59,6 +81,23 @@ class WebChannel(Channel):
             raise ValueError(
                 f"Jina Reader response exceeds {_MAX_RESPONSE_BYTES} byte limit"
             )
+        if _is_antibot_page(body):
+            raise RuntimeError(
+                "Jina Reader 返回了反爬验证页，未获取到目标内容；"
+                "请改用站点专用工具或浏览器读取"
+            )
+        return body.decode("utf-8")
+
+    def read_bounded(self, url: str, *, timeout: int = _READ_TIMEOUT_SECONDS) -> str:
+        """Read through Jina with a strict wall-clock budget for automation."""
+        url = normalize_public_http_url(url)
+        jina_url = f"https://r.jina.ai/{url}"
+        req = urllib.request.Request(
+            jina_url,
+            headers={"User-Agent": _UA, "Accept": "text/plain"},
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            body = _read_limited(resp, timeout=timeout)
         if _is_antibot_page(body):
             raise RuntimeError(
                 "Jina Reader 返回了反爬验证页，未获取到目标内容；"
