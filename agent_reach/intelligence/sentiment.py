@@ -36,7 +36,6 @@ SENTIMENT_PLATFORM_ORDER = (
 )
 _BILIBILI_PAGE_SIZE = 20
 _YOUTUBE_RESULT_LIMIT = 20
-_MAX_AUTHOR_MENTIONS = 2
 
 _POSITIVE_TERMS = (
     "bullish", "buy", "bought", "buying", "gain", "gains", "growth", "strong",
@@ -698,16 +697,13 @@ def _label_signal(signal: Signal) -> str:
     text = f"{signal.english_translation or ''} {signal.original_text} {signal.title}".casefold()
     positive = sum(term in text for term in _POSITIVE_TERMS)
     negative = sum(term in text for term in _NEGATIVE_TERMS)
-    uncertain = sum(term in text for term in _UNCERTAIN_TERMS)
     if positive and negative:
-        return "MIXED"
-    if uncertain and not positive and not negative:
-        return "UNCERTAIN"
+        return "NON_DIRECTIONAL"
     if positive > negative:
         return "POSITIVE"
     if negative > positive:
         return "NEGATIVE"
-    return "NEUTRAL"
+    return "NON_DIRECTIONAL"
 
 
 def _engagement_value(signal: Signal) -> float:
@@ -781,10 +777,11 @@ def _prose(
     elif negative:
         sentence += f" Negative posts focus on {_keyword_themes(negative)}."
     sentence += (
-        f" The meter is calculated from retained, deduplicated mentions with {coverage_label.lower()} "
-        "coverage. It reflects discussion, not a forecast of price or personal financial advice."
+        f" The meter is calculated from every qualifying mention with {coverage_label.lower()} "
+        "coverage; duplicates and reposts remain in talk volume and are flagged in the audit. It reflects discussion, not a forecast of price or personal financial advice."
     )
     return sentence
+
 
 
 def build_investible_sentiments(
@@ -794,17 +791,11 @@ def build_investible_sentiments(
     retrieval_ledger: list[dict[str, Any]],
     retrieved_at_utc: datetime,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
-    """Normalize, deduplicate, classify, and aggregate retained sentiment posts."""
+    """Build the exhaustive sentiment corpus without deduplicating or truncating."""
 
     from .normalize import normalize_records
 
-    raw_posts = list(posts)
-    signals = normalize_records(
-        raw_posts,
-        retrieved_at_utc=retrieved_at_utc,
-        multilingual=True,
-    )
-    ledger_by_pair = {(row["investible_id"], row["platform"]): row for row in retrieval_ledger}
+    signals = normalize_records(list(posts), retrieved_at_utc=retrieved_at_utc, multilingual=True)
     by_investible: dict[str, list[Signal]] = defaultdict(list)
     for signal in signals:
         investible_id = signal.metadata.get("sentiment_investible_id")
@@ -816,159 +807,103 @@ def build_investible_sentiments(
     for investible in investibles:
         candidates = sorted(
             by_investible.get(investible.investible_id, []),
-            key=lambda signal: (
-                signal.published_at_utc or datetime.min.replace(tzinfo=UTC),
-                signal.signal_id,
-            ),
+            key=lambda signal: (signal.published_at_utc or datetime.min.replace(tzinfo=UTC), signal.signal_id),
             reverse=True,
         )
-        unique, duplicates = _deduplicate_sentiment_signals(candidates)
-        for signal in duplicates:
-            pair = ledger_by_pair.get((investible.investible_id, signal.platform))
-            if pair:
-                pair["duplicates_removed"] += 1
-                _bump_exclusion(pair, "duplicate_repost_or_canonical_url")
-        author_counts: Counter[tuple[str, str]] = Counter()
         retained: list[Signal] = []
-        for signal in unique:
-            author_key = (signal.platform, signal.author.casefold()) if signal.author else ("", "")
-            if author_key != ("", ""):
-                author_counts[author_key] += 1
-                if author_counts[author_key] > _MAX_AUTHOR_MENTIONS:
-                    pair = ledger_by_pair.get((investible.investible_id, signal.platform))
-                    if pair:
-                        _bump_exclusion(pair, "single_author_cap")
-                    continue
+        seen_observations: dict[str, str] = {}
+        for occurrence, signal in enumerate(candidates, 1):
+            canonical = _canonical_url(signal.url)
+            text_key = re.sub(r"[^a-z0-9\u3400-\u9fff]+", " ", signal.original_text.casefold()).strip()
+            duplicate_key = f"url:{canonical}" if canonical else f"text:{signal.author or ''}:{text_key}"
+            duplicate_of = seen_observations.get(duplicate_key)
+            signal.metadata = dict(signal.metadata)
+            signal.metadata["duplicate_repost_flag"] = bool(duplicate_of)
+            if duplicate_of:
+                signal.metadata["duplicate_of_observation"] = duplicate_of
+            if any(existing.signal_id == signal.signal_id for existing in retained):
+                signal.signal_id = f"{signal.signal_id}-observation-{occurrence}"
+            seen_observations.setdefault(duplicate_key, signal.signal_id)
             retained.append(signal)
+
         labels = {signal.signal_id: _label_signal(signal) for signal in retained}
         platform_max: dict[str, float] = defaultdict(float)
         for signal in retained:
-            platform_max[signal.platform] = max(
-                platform_max[signal.platform],
-                math.log1p(_engagement_value(signal)),
-            )
+            platform_max[signal.platform] = max(platform_max[signal.platform], math.log1p(_engagement_value(signal)))
         weights: dict[str, float] = {}
         for signal in retained:
             maximum = platform_max[signal.platform]
-            engagement_weight = (
-                0.0
-                if maximum == 0
-                else min(0.5, 0.5 * math.log1p(_engagement_value(signal)) / maximum)
-            )
-            weights[signal.signal_id] = 1.0 + engagement_weight
+            weights[signal.signal_id] = 1.0 if maximum == 0 else 1.0 + min(0.5, 0.5 * math.log1p(_engagement_value(signal)) / maximum)
         source_ids = {_signal_source(signal) for signal in retained}
-        positive_weight = sum(
-            weights[signal.signal_id] for signal in retained if labels[signal.signal_id] == "POSITIVE"
-        )
-        negative_weight = sum(
-            weights[signal.signal_id] for signal in retained if labels[signal.signal_id] == "NEGATIVE"
-        )
+        positive_weight = sum(weights[signal.signal_id] for signal in retained if labels[signal.signal_id] == "POSITIVE")
+        negative_weight = sum(weights[signal.signal_id] for signal in retained if labels[signal.signal_id] == "NEGATIVE")
         directional_weight = positive_weight + negative_weight
+        directional_count = sum(labels[signal.signal_id] in {"POSITIVE", "NEGATIVE"} for signal in retained)
         independent_count = len(source_ids)
         positive_percent: int | None = None
         negative_percent: int | None = None
-        if len(retained) >= 3 and independent_count >= 2 and directional_weight > 0:
+        if directional_count >= 3 and independent_count >= 2 and directional_weight > 0:
             positive_percent = int(round(positive_weight / directional_weight * 100))
             negative_percent = 100 - positive_percent
-        ledger_pairs = [
-            row for row in retrieval_ledger if row["investible_id"] == investible.investible_id
-        ]
-        live_pairs = [
-            row for row in ledger_pairs
-            if row.get(
-                "live_validated",
-                row["platform"] in SOCIAL_PLATFORMS
-                and row["terminal_reason"] not in {"AUTH_REQUIRED", "BACKEND_FAILURE"},
-            )
-        ]
-        if not live_pairs:
-            coverage_label = "INSUFFICIENT DATA"
-        elif all(row["exhaustive_boolean"] for row in live_pairs):
-            coverage_label = "COVERAGE COMPLETE"
-        else:
-            coverage_label = "COVERAGE PARTIAL"
-        meter_status = "METER READY" if positive_percent is not None else "INSUFFICIENT DATA"
+
+        ledger_pairs = [row for row in retrieval_ledger if row["investible_id"] == investible.investible_id]
+        live_pairs = [row for row in ledger_pairs if row.get("live_validated", row["platform"] in SOCIAL_PLATFORMS and row["terminal_reason"] not in {"AUTH_REQUIRED", "BACKEND_FAILURE"})]
+        coverage_label = "INSUFFICIENT DATA" if not live_pairs else "COVERAGE COMPLETE" if all(row["exhaustive_boolean"] for row in live_pairs) else "COVERAGE PARTIAL"
+        meter_status = "METER READY" if positive_percent is not None else "INSUFFICIENT DIRECTIONAL DATA"
         rows_by_label = {
-            label: [
-                _sentiment_signal_json(signal, label)
-                for signal in retained
-                if labels[signal.signal_id] == label
-            ]
-            for label in ("POSITIVE", "NEGATIVE", "NEUTRAL", "MIXED", "UNCERTAIN")
+            label: [_sentiment_signal_json(signal, label) for signal in retained if labels[signal.signal_id] == label]
+            for label in ("POSITIVE", "NEGATIVE", "NON_DIRECTIONAL")
         }
         representatives = []
-        for label in ("POSITIVE", "NEGATIVE", "NEUTRAL", "MIXED", "UNCERTAIN"):
+        for label in ("POSITIVE", "NEGATIVE", "NON_DIRECTIONAL"):
             if rows_by_label[label]:
                 representatives.append({**rows_by_label[label][0], "evidence_role": label.casefold()})
         retained_ids = [signal.signal_id for signal in retained]
+        latest = max((signal.published_at_utc for signal in retained if signal.published_at_utc), default=None)
         for row in ledger_pairs:
-            row["retained_posts"] = sum(
-                1 for signal in retained if signal.platform == row["platform"]
-            )
-        output = {
+            row["retained_posts"] = sum(signal.platform == row["platform"] for signal in retained)
+            row["duplicates_removed"] = 0
+        outputs.append({
             **investible.to_dict(),
             "coverage": coverage_label,
             "meter_status": meter_status,
             "positive_percent": positive_percent,
             "negative_percent": negative_percent,
             "retained_post_count": len(retained),
+            "talk_volume": len(retained),
+            "directional_mention_count": directional_count,
             "independent_mention_count": independent_count,
+            "platform_count": len({signal.platform for signal in retained}),
+            "latest_mention_utc": iso_utc(latest),
             "sentiment_counts": {label: len(rows_by_label[label]) for label in rows_by_label},
             "retained_signal_ids": retained_ids,
             "representative_sources": representatives[:6],
             "positive_sources": rows_by_label["POSITIVE"][:4],
             "negative_sources": rows_by_label["NEGATIVE"][:4],
-            "neutral_mixed_sources": (
-                rows_by_label["NEUTRAL"] + rows_by_label["MIXED"] + rows_by_label["UNCERTAIN"]
-            )[:4],
-            "system_prose": _prose(
-                investible,
-                posts=retained,
-                labels=labels,
-                positive_percent=positive_percent,
-                negative_percent=negative_percent,
-                coverage_label=coverage_label,
-                independent_count=independent_count,
-            ),
+            "neutral_mixed_sources": rows_by_label["NON_DIRECTIONAL"][:4],
+            "system_prose": _prose(investible, posts=retained, labels=labels, positive_percent=positive_percent, negative_percent=negative_percent, coverage_label=coverage_label, independent_count=independent_count),
             "retrieved_at_utc": iso_utc(retrieved_at_utc),
             "retrieved_at_sgt": iso_sgt(retrieved_at_utc),
-        }
-        outputs.append(output)
-        sentiment_ledger.append(
-            {
-                "investible_id": investible.investible_id,
-                "name": investible.name,
-                "ticker": investible.ticker,
-                "coverage": coverage_label,
-                "meter_status": meter_status,
-                "positive_percent": positive_percent,
-                "negative_percent": negative_percent,
-                "retained_signal_ids": retained_ids,
-                "positive_signal_ids": [
-                    signal.signal_id for signal in retained if labels[signal.signal_id] == "POSITIVE"
-                ],
-                "negative_signal_ids": [
-                    signal.signal_id for signal in retained if labels[signal.signal_id] == "NEGATIVE"
-                ],
-                "neutral_mixed_signal_ids": [
-                    signal.signal_id
-                    for signal in retained
-                    if labels[signal.signal_id] in {"NEUTRAL", "MIXED", "UNCERTAIN"}
-                ],
-                "independent_source_ids": sorted(source_ids),
-                "retrieval_pair_count": len(ledger_pairs),
-            }
-        )
-    retained_ids = {
-        signal_id
-        for row in sentiment_ledger
-        for signal_id in row["retained_signal_ids"]
-    }
-    sentiment_posts = [
-        _sentiment_signal_json(signal, _label_signal(signal))
-        for signal in signals
-        if signal.signal_id in retained_ids
-    ]
+        })
+        sentiment_ledger.append({
+            "investible_id": investible.investible_id,
+            "name": investible.name,
+            "ticker": investible.ticker,
+            "coverage": coverage_label,
+            "meter_status": meter_status,
+            "positive_percent": positive_percent,
+            "negative_percent": negative_percent,
+            "retained_signal_ids": retained_ids,
+            "positive_signal_ids": [signal.signal_id for signal in retained if labels[signal.signal_id] == "POSITIVE"],
+            "negative_signal_ids": [signal.signal_id for signal in retained if labels[signal.signal_id] == "NEGATIVE"],
+            "non_directional_signal_ids": [signal.signal_id for signal in retained if labels[signal.signal_id] == "NON_DIRECTIONAL"],
+            "independent_source_ids": sorted(source_ids),
+            "retrieval_pair_count": len(ledger_pairs),
+        })
+
+    outputs.sort(key=lambda item: (-int(item.get("talk_volume", 0)), -int(item.get("directional_mention_count", 0)), -int(item.get("platform_count", 0)), item.get("latest_mention_utc") or "", str(item.get("investible_id"))))
+    retained_ids = {signal_id for row in sentiment_ledger for signal_id in row["retained_signal_ids"]}
+    sentiment_posts = [_sentiment_signal_json(signal, _label_signal(signal)) for signal in signals if signal.signal_id in retained_ids]
     return outputs, sentiment_ledger, sentiment_posts
 
 
@@ -1020,7 +955,7 @@ def render_sentiment_report(
             f"Investible × platform rows: {len(retrieval_ledger)}",
             f"Exhaustive rows: {sum(bool(row['exhaustive_boolean']) for row in retrieval_ledger)}",
             (
-                "The percentage describes only retained, deduplicated full-content posts. "
+                "The percentage describes only all qualifying full-content observations. "
                 "Platform limits and failures remain explicit in sentiment_retrieval_ledger.json."
             ),
         ]

@@ -166,7 +166,7 @@ def _post(index: int, text: str, author: str):
     }
 
 
-def test_meter_is_traced_and_duplicate_removed():
+def test_meter_is_traced_and_duplicate_retained():
     posts = [
         _post(1, "Bitcoin bullish growth", "a"),
         _post(2, "Bitcoin bearish risk", "b"),
@@ -184,7 +184,9 @@ def test_meter_is_traced_and_duplicate_removed():
     assert result["meter_status"] == "METER READY"
     assert result["positive_percent"] + result["negative_percent"] == 100
     assert result["coverage"] == "COVERAGE PARTIAL"
-    assert retrieval_ledger[0]["duplicates_removed"] == 1
+    assert retrieval_ledger[0]["duplicates_removed"] == 0
+    assert result["retained_post_count"] == 4
+    assert any(post.get("metadata", {}).get("duplicate_repost_flag") for post in retained_posts)
     assert set(result["retained_signal_ids"]) == {post["signal_id"] for post in retained_posts}
 
 
@@ -195,7 +197,7 @@ def test_insufficient_data_suppresses_percentage():
         retrieval_ledger=_ledger(),
         retrieved_at_utc=NOW,
     )
-    assert results[0]["meter_status"] == "INSUFFICIENT DATA"
+    assert results[0]["meter_status"] == "INSUFFICIENT DIRECTIONAL DATA"
     assert results[0]["positive_percent"] is None
     assert "too small" in results[0]["system_prose"]
 

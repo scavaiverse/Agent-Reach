@@ -6,6 +6,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import tempfile
 import time
 from dataclasses import dataclass
@@ -20,9 +21,12 @@ from .investibles import selected_investibles
 from .momentum import add_momentum
 from .normalize import apply_time_window, deduplicate_signals, normalize_records
 from .otr_mapping import map_topics_to_otr
+from .pre_run import scan_live_social_pulse
+from .prices import collect_price_receipts, resolve_previous_sentiments
 from .report import render_report
 from .schema import Signal, iso_sgt, iso_utc, parse_datetime
 from .scoring import is_social_signal, score_clusters
+from .self_healing import SelfHealingCoordinator
 from .sentiment import (
     build_investible_sentiments,
     collect_investible_sentiments,
@@ -46,7 +50,11 @@ class IntelligenceRun:
     sentiment_posts: list[dict[str, Any]]
 
     def write(self, output_dir: str | Path) -> None:
-        target = Path(output_dir)
+        output_target = Path(output_dir)
+        output_target.mkdir(parents=True, exist_ok=True)
+        target = output_target / ".candidates" / self.data["run_id"]
+        if target.exists():
+            shutil.rmtree(target)
         target.mkdir(parents=True, exist_ok=True)
         _write_json(target / "latest_cross_platform_intelligence.json", self.data)
         _write_json(
@@ -114,7 +122,7 @@ class IntelligenceRun:
         )
         _write_json(target / "otr_research_escalation_queue.json", {"topics": self.data.get("unmatched_high_buzz_topics", [])})
         _write_json(
-            target / "top_30_social_buzz.json",
+            target / "top_50_social_buzz.json",
             {
                 "schema_version": "otr-social-buzz-1",
                 "run_id": self.data["run_id"],
@@ -126,6 +134,21 @@ class IntelligenceRun:
             },
         )
         _write_json(target / "social_chatter_public.json", self.public_payload)
+        _write_json(target / "social_pulse_pre_run_scan.json", self.data.get("pre_run_scan", {}))
+        _write_json(target / "investible_price_receipts.json", {"run_id": self.data["run_id"], "receipts": self.data.get("investible_price_receipts", [])})
+        _write_json(target / "investible_sentiment_current.json", {"run_id": self.data["run_id"], "retrieved_at_utc": self.data["retrieval_time_utc"], "items": self.data.get("investible_sentiments", [])})
+        history_path = target / "investible_sentiment_history.json"
+        history = []
+        previous_history_path = output_target / "investible_sentiment_history.json"
+        if previous_history_path.exists():
+            try:
+                loaded = json.loads(previous_history_path.read_text(encoding="utf-8"))
+                history = loaded if isinstance(loaded, list) else loaded.get("runs", [])
+            except (OSError, json.JSONDecodeError):
+                history = []
+        history = [item for item in history if item.get("run_id") != self.data["run_id"]]
+        history.append(self.data.get("investible_sentiment_history_entry", {"run_id": self.data["run_id"], "items": self.data.get("investible_sentiments", [])}))
+        _write_json(history_path, history[-90:])
         _atomic_write_text(target / "latest_cross_platform_intelligence.md", self.report + "\n")
         history_dir = target / "history"
         _write_json(
@@ -141,9 +164,10 @@ class IntelligenceRun:
         )
         momentum_path = target / "momentum_history.json"
         prior_history: list[dict[str, Any]] = []
-        if momentum_path.exists():
+        previous_momentum_path = output_target / "momentum_history.json"
+        if previous_momentum_path.exists():
             try:
-                loaded = json.loads(momentum_path.read_text(encoding="utf-8"))
+                loaded = json.loads(previous_momentum_path.read_text(encoding="utf-8"))
                 if isinstance(loaded, list):
                     prior_history = [item for item in loaded if isinstance(item, dict)]
             except (OSError, json.JSONDecodeError):
@@ -157,6 +181,7 @@ class IntelligenceRun:
                     "canonical_title": topic.get("canonical_title"),
                     "social_buzz_score": topic.get("social_buzz_score", 0),
                     "momentum_status": topic.get("momentum_status", "NEW"),
+        "trend_status": topic.get("momentum_status", "INSUFFICIENT_HISTORY"),
                     "social_signal_count": topic.get("social_signal_count", 0),
                 }
                 for topic in self.data.get("topics", [])
@@ -164,11 +189,87 @@ class IntelligenceRun:
         }
         prior_history = [item for item in prior_history if item.get("run_id") != entry["run_id"]]
         _write_json(momentum_path, prior_history[-29:] + [entry])
+        _write_json(
+            target / "publication_state.json",
+            {
+                "status": "READY",
+                "run_id": self.data["run_id"],
+                "retrieval_time_utc": self.data["retrieval_time_utc"],
+                "schema_version": "otr-social-pulse-publication-v1",
+            },
+        )
+        _validate_candidate_publication(target, self.data["run_id"])
+        _promote_candidate_publication(target, output_target)
 
 
 def _write_json(path: Path, payload: Any) -> None:
     text = json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True, default=_json_default) + "\n"
     _atomic_write_text(path, text)
+
+
+def _validate_candidate_publication(candidate: Path, run_id: str) -> None:
+    required = (
+        "latest_cross_platform_intelligence.json",
+        "social_chatter_public.json",
+        "top_50_social_buzz.json",
+        "raw_social_signals.json",
+        "social_topic_clusters.json",
+        "source_ledger.json",
+        "platform_coverage.json",
+        "verification_ledger.json",
+        "publication_state.json",
+    )
+    for name in required:
+        path = candidate / name
+        if not path.is_file():
+            raise RuntimeError(f"candidate publication missing {name}")
+        try:
+            json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RuntimeError(f"candidate publication has invalid {name}: {exc}") from exc
+    for name in ("latest_cross_platform_intelligence.json", "top_50_social_buzz.json", "social_chatter_public.json"):
+        payload = json.loads((candidate / name).read_text(encoding="utf-8"))
+        if payload.get("run_id") != run_id:
+            raise RuntimeError(f"candidate publication run id mismatch in {name}")
+
+
+def _promote_candidate_publication(candidate: Path, output_target: Path) -> None:
+    """Promote a validated candidate and restore the prior set on failure."""
+
+    backup = output_target / ".rollback" / candidate.name
+    if backup.exists():
+        shutil.rmtree(backup)
+    backup.mkdir(parents=True, exist_ok=True)
+    promoted: list[Path] = []
+    backups: list[tuple[Path, Path]] = []
+    files = sorted(
+        (path for path in candidate.rglob("*") if path.is_file()),
+        key=lambda path: (path.name == "publication_state.json", str(path)),
+    )
+    try:
+        for source in files:
+            relative = source.relative_to(candidate)
+            destination = output_target / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            if destination.exists():
+                old = backup / relative
+                old.parent.mkdir(parents=True, exist_ok=True)
+                os.replace(destination, old)
+                backups.append((old, destination))
+            os.replace(source, destination)
+            promoted.append(destination)
+    except Exception:
+        for destination in reversed(promoted):
+            destination.unlink(missing_ok=True)
+        for old, destination in reversed(backups):
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(old, destination)
+        raise
+    finally:
+        if candidate.exists():
+            shutil.rmtree(candidate)
+        if backup.exists():
+            shutil.rmtree(backup)
 
 
 def _atomic_write_text(path: Path, text: str) -> None:
@@ -301,6 +402,8 @@ def _public_topic(topic: dict[str, Any]) -> dict[str, Any]:
     return {
         "topic_id": topic["topic_id"],
         "title": topic["canonical_title"],
+        "original_title": topic["canonical_title"],
+        "english_translation": next((signal.english_translation for signal in social_signals if signal.english_translation), None),
         "summary": f"{len(social_signals)} social signal(s) from {topic.get('social_platform_count', 0)} social platform(s); discussion is evidence of attention, not proof of the underlying claim.",
         "social_buzz_score": topic.get("social_buzz_score", 0),
         "social_buzz_components": topic.get("social_buzz_components", {}),
@@ -330,6 +433,7 @@ def _public_topic(topic: dict[str, Any]) -> dict[str, Any]:
         "importance_score": topic.get("importance_score", 0),
         "score_components": topic.get("score_components", {}),
         "momentum_status": topic.get("momentum_status", "NEW"),
+        "trend_status": topic.get("momentum_status", "INSUFFICIENT_HISTORY"),
         "previous_signal_count": topic.get("previous_signal_count", 0),
         "signal_count_delta": topic.get("signal_count_delta", 0),
         "current_rank": topic.get("current_rank"),
@@ -361,6 +465,8 @@ def _public_payload(
     coverage: dict,
     source_ledger: list[dict[str, Any]],
     investible_sentiments: list[dict[str, Any]],
+    previous_investible_sentiments: list[dict[str, Any]] | None = None,
+    previous_price_resolution: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Create the safe public hand-off consumed by the OnTheRice site."""
 
@@ -378,6 +484,9 @@ def _public_payload(
         "accepted_signal_count": data["accepted_signal_count"],
         "top_n_requested": data["top_n_requested"],
         "ranking_basis": "SOCIAL_BUZZ_SCORE; verification annotates candidates after discovery and does not remove unverified discussion.",
+        "coverage_label": data.get("coverage_label", "TOP 50 FROM CURRENTLY ACCESSIBLE COVERAGE"),
+        "coverage_scope": data.get("coverage_scope", "TOP 50 FROM CURRENTLY ACCESSIBLE COVERAGE"),
+        "coverage_audit": data.get("coverage_audit", {}),
         "unique_topic_count": data["unique_topic_count"],
         "qualifying_social_cluster_count": data.get("qualifying_social_cluster_count", 0),
         "source_count": len(source_ledger),
@@ -395,6 +504,7 @@ def _public_payload(
         ],
         "topics": [_public_topic(topic) for topic in topics],
         "investible_sentiments": investible_sentiments,
+        "previous_investible_sentiments": previous_price_resolution or [],
         "sentiment_live_validated_platforms": data.get("sentiment_live_validated_platforms", []),
         "sentiment_retrieval_summary": {
             "row_count": data.get("sentiment_retrieval_row_count", 0),
@@ -463,7 +573,7 @@ def _diversity(
 def run_intelligence(
     *,
     window_hours: float = 24,
-    top_n: int = 30,
+    top_n: int = 50,
     multilingual: bool = False,
     verify: bool = False,
     output_dir: str | Path = "output",
@@ -474,6 +584,17 @@ def run_intelligence(
     if top_n <= 0:
         raise ValueError("top must be positive")
     pipeline_started = time.monotonic()
+    target = Path(output_dir)
+    coordinator = SelfHealingCoordinator.begin(target, budget_seconds=global_timeout_seconds)
+    pre_run_scan, pre_run_state = coordinator.run_optional(
+        "pre_run_scan",
+        lambda: scan_live_social_pulse(target),
+        {"scan_status": "LIVE_PAGE_SCAN_UNAVAILABLE", "errors": ["pre-run scan did not complete"]},
+    )
+    coordinator.checkpoint(
+        "preflight",
+        {"pre_run_scan": pre_run_scan, "pre_run_state": pre_run_state, "top_n": top_n, "window_hours": window_hours},
+    )
     sentiment_reserved_budget_seconds = max(1, min(120, int(global_timeout_seconds * 0.35)))
     verification_budget_seconds = max(1, min(60, int(global_timeout_seconds * 0.2)))
     collection_budget_seconds = max(
@@ -486,9 +607,30 @@ def run_intelligence(
         multilingual=multilingual,
         global_timeout_seconds=collection_budget_seconds,
     )
-    collection = collector.collect()
+    try:
+        collection = collector.collect()
+    except Exception as exc:
+        coordinator.repair_attempt("collection", change="preserved last-known-good output and closed the collection stage", outcome=f"{type(exc).__name__}: {exc}"[:500])
+        coordinator.finish(status="FAILED", summary={"error": str(exc)[:500]})
+        raise
     retrieved = collection.retrieved_at_utc
-    target = Path(output_dir)
+    coordinator.checkpoint(
+        "collection",
+        {"record_count": len(collection.records), "coverage": serialize_coverage(collection.coverage)},
+    )
+    for platform, coverage_item in collection.coverage.items():
+        coordinator.checkpoint(
+            f"platform-{platform}",
+            {
+                "platform": platform,
+                "status": coverage_item.status,
+                "queried": coverage_item.queried,
+                "results": coverage_item.results,
+                "backend": coverage_item.backend,
+                "failure_reason": coverage_item.failure_reason,
+                "record_count": sum(1 for record in collection.records if record.get("platform") == platform),
+            },
+        )
     previous_data: dict[str, Any] | None = None
     previous_path = target / "latest_cross_platform_intelligence.json"
     if previous_path.exists():
@@ -519,12 +661,17 @@ def run_intelligence(
     # change the deterministic ranking.
     scored = verify_topics(scored, perform_reads=False)
     buzz_candidates = [topic for topic in scored if topic.get("social_signal_count", 0) > 0]
+    verification_state = {"status": "SKIPPED"}
     if verify:
-        verified_top = verify_topics(
+        verified_top, verification_state = coordinator.run_optional(
+            "verification",
+            lambda: verify_topics(
+                buzz_candidates[:top_n],
+                perform_reads=True,
+                max_reads=min(top_n, 10),
+                time_budget_seconds=verification_budget_seconds,
+            ),
             buzz_candidates[:top_n],
-            perform_reads=True,
-            max_reads=min(top_n, 10),
-            time_budget_seconds=verification_budget_seconds,
         )
         verified_by_id = {topic["topic_id"]: topic for topic in verified_top}
         scored = [verified_by_id.get(topic["topic_id"], topic) for topic in scored]
@@ -550,20 +697,95 @@ def run_intelligence(
             int(global_timeout_seconds - (time.monotonic() - pipeline_started)),
         ),
     )
-    sentiment_collection = collect_investible_sentiments(
-        investibles=selected_investibles(),
-        coverage=coverage,
-        existing_signals=accepted,
-        retrieved_at_utc=retrieved,
-        window_hours=window_hours,
-        global_timeout_seconds=sentiment_timeout,
-    )
+    previous_sentiments: list[dict[str, Any]] = []
+    previous_receipts: list[dict[str, Any]] = []
+    current_sentiment_path = target / "investible_sentiment_current.json"
+    receipts_path = target / "investible_price_receipts.json"
+    if current_sentiment_path.exists():
+        try:
+            previous_sentiments = json.loads(current_sentiment_path.read_text(encoding="utf-8")).get("items", [])
+        except (OSError, json.JSONDecodeError):
+            previous_sentiments = []
+    if receipts_path.exists():
+        try:
+            previous_receipts = json.loads(receipts_path.read_text(encoding="utf-8")).get("receipts", [])
+        except (OSError, json.JSONDecodeError):
+            previous_receipts = []
+    try:
+        sentiment_collection = collect_investible_sentiments(
+            investibles=selected_investibles(),
+            coverage=coverage,
+            existing_signals=accepted,
+            retrieved_at_utc=retrieved,
+            window_hours=window_hours,
+            global_timeout_seconds=sentiment_timeout,
+        )
+        sentiment_state = {"stage": "sentiment_collection", "status": "COMPLETE"}
+        coordinator.checkpoint("sentiment_collection", {"posts": len(sentiment_collection.posts), "rows": len(sentiment_collection.retrieval_ledger)})
+    except Exception as exc:
+        coordinator.repair_attempt("sentiment_collection", change="preserved completed buzz lanes and emitted an empty auditable sentiment lane", outcome=f"{type(exc).__name__}: {exc}"[:500])
+        from .sentiment import SentimentCollection
+        now = datetime.now(timezone.utc)
+        sentiment_collection = SentimentCollection([], [], [], now, now)
+        sentiment_state = {"stage": "sentiment_collection", "status": "DEGRADED", "error": str(exc)[:500]}
+        coordinator.checkpoint("sentiment_collection", sentiment_state, status="DEGRADED")
     investible_sentiments, sentiment_ledger, sentiment_posts = build_investible_sentiments(
         investibles=selected_investibles(),
         posts=sentiment_collection.posts,
         retrieval_ledger=sentiment_collection.retrieval_ledger,
         retrieved_at_utc=retrieved,
     )
+    price_budget = max(1, min(45, int(global_timeout_seconds - (time.monotonic() - pipeline_started))))
+    price_receipts, price_state = coordinator.run_optional(
+        "price_receipts",
+        lambda: collect_price_receipts(
+            selected_investibles(),
+            published_at_utc=retrieved,
+            retrieved_at_utc=datetime.now(timezone.utc),
+            timeout_seconds=price_budget,
+        ),
+        [],
+    )
+    previous_price_resolution, resolution_state = coordinator.run_optional(
+        "price_resolution",
+        lambda: resolve_previous_sentiments(
+            previous_sentiments,
+            previous_receipts,
+            retrieved_at_utc=retrieved,
+            timeout_seconds=price_budget,
+        ),
+        [],
+    )
+    if not previous_price_resolution and previous_sentiments:
+        # A bounded price outage must not erase the prior edition. Preserve
+        # each prior record and make the missing resolution explicit.
+        previous_price_resolution = []
+        for prior in previous_sentiments:
+            unresolved = dict(prior)
+            unresolved.update(
+                {
+                    "direction": "UNRESOLVED - PRICE RECEIPT MISSING",
+                    "resolved_price": None,
+                    "resolved_timestamp_utc": None,
+                    "percentage_move": None,
+                    "source_url": None,
+                }
+            )
+            previous_price_resolution.append(unresolved)
+    for item in investible_sentiments:
+        receipt = next((row for row in price_receipts if row.get("investible_id") == item.get("investible_id")), None)
+        item["entry_price"] = receipt.get("entry_price") if receipt else None
+        item["entry_timestamp_utc"] = receipt.get("entry_timestamp_utc") if receipt else None
+        item["entry_price_status"] = receipt.get("status") if receipt else "ENTRY PRICE UNAVAILABLE"
+        item["entry_price_source_url"] = receipt.get("source_url") if receipt else None
+    region_counts: dict[str, int] = {}
+    for topic in top_topics:
+        for region in topic.get("social_regions", []) or topic.get("regions", []):
+            region_counts[str(region)] = region_counts.get(str(region), 0) + 1
+    dominant_region, dominant_count = (max(region_counts.items(), key=lambda item: item[1]) if region_counts else (None, 0))
+    coverage_audit = {"region_counts": region_counts, "dominant_region": dominant_region, "dominant_topic_count": dominant_count, "dominant_share": round(dominant_count / len(top_topics), 4) if top_topics else 0, "passes_global_balance": not bool(top_topics) or dominant_count / len(top_topics) <= 0.4}
+    coverage_label = "GLOBAL" if coverage_audit["passes_global_balance"] else "COVERAGE_BIASED"
+    coverage_scope = "GLOBAL" if coverage_label == "GLOBAL" else "TOP 50 FROM CURRENTLY ACCESSIBLE COVERAGE"
     diversity = _diversity(
         coverage=coverage,
         signals=signals,
@@ -590,7 +812,22 @@ def run_intelligence(
         "window_hours": window_hours,
         "top_n_requested": top_n,
         "multilingual": multilingual,
+        "coverage_label": coverage_label,
+        "coverage_scope": coverage_scope,
+        "coverage_audit": coverage_audit,
+        "pre_run_scan": pre_run_scan,
+        "investible_price_receipts": price_receipts,
+        "previous_investible_sentiments": previous_price_resolution,
         "verification_requested": verify,
+        "self_healing": {
+            "coordinator_run_id": coordinator.run_id,
+            "pre_run_state": pre_run_state,
+            "verification_state": verification_state,
+            "price_state": price_state,
+            "price_resolution_state": resolution_state,
+            "sentiment_state": sentiment_state,
+            "remaining_seconds_before_write": coordinator.remaining_seconds,
+        },
         "history_count": (int(previous_data.get("history_count", 0)) + 1) if previous_data else 1,
         "global_collection_timeout_seconds": global_timeout_seconds,
         "collection_budget_seconds": collection_budget_seconds,
@@ -623,6 +860,7 @@ def run_intelligence(
         "unmatched_high_buzz_topics": otr_mapping["unmatched_high_buzz_topics"],
         "topics": [_topic_json(topic) for topic in top_topics],
         "investible_sentiments": investible_sentiments,
+        "previous_investible_sentiments": previous_price_resolution or [],
         "sentiment_live_validated_platforms": sentiment_collection.live_validated_platforms,
         "sentiment_retrieval_row_count": len(sentiment_collection.retrieval_ledger),
         "sentiment_exhaustive_row_count": sum(
@@ -630,6 +868,7 @@ def run_intelligence(
         ),
         "sentiment_collection_started_at_utc": iso_utc(sentiment_collection.started_at_utc),
         "sentiment_collection_finished_at_utc": iso_utc(sentiment_collection.completed_at_utc),
+        "investible_sentiment_history_entry": {"run_id": run_id, "retrieved_at_utc": iso_utc(retrieved), "items": investible_sentiments},
         "sentiment_collection_runtime_seconds": (
             sentiment_collection.completed_at_utc - sentiment_collection.started_at_utc
         ).total_seconds(),
@@ -657,6 +896,8 @@ def run_intelligence(
         coverage=coverage,
         source_ledger=source_ledger,
         investible_sentiments=investible_sentiments,
+        previous_investible_sentiments=previous_sentiments,
+        previous_price_resolution=previous_price_resolution,
     )
     data["source_ledger_count"] = len(source_ledger)
     raw_json = [signal.to_dict() for signal in signals]
@@ -698,14 +939,26 @@ def run_intelligence(
         sentiment_ledger=sentiment_ledger,
         sentiment_posts=sentiment_posts,
     )
-    run.write(output_dir)
+    try:
+        run.write(output_dir)
+        coordinator.finish(
+            status="COMPLETE" if all(
+                state.get("status") in {"COMPLETE", "SKIPPED"}
+                for state in (pre_run_state, verification_state, price_state, resolution_state, sentiment_state)
+            ) else "DEGRADED",
+            summary={"final_run_id": run_id, "topic_count": len(top_topics)},
+        )
+    except Exception as exc:
+        coordinator.repair_attempt("write", change="did not promote a new public dataset", outcome=f"{type(exc).__name__}: {exc}"[:500])
+        coordinator.finish(status="FAILED", summary={"error": str(exc)[:500]})
+        raise
     return run
 
 
 def rerank_stored_signals(
     raw_payload: dict[str, Any],
     *,
-    top_n: int = 30,
+    top_n: int = 50,
     verify: bool = False,
 ) -> list[dict[str, Any]]:
     """Re-run filtering, clustering, and ranking from ``raw_social_signals.json``."""

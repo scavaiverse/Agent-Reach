@@ -27,6 +27,11 @@ def audit(output_dir: Path) -> dict[str, object]:
     retrieval_ledger = _load(output_dir / "sentiment_retrieval_ledger.json")
     sentiment_ledger = _load(output_dir / "sentiment_ledger.json")
     sentiment_posts = _load(output_dir / "sentiment_posts.json")
+    pre_run_scan = _load(output_dir / "social_pulse_pre_run_scan.json")
+    top50 = _load(output_dir / "top_50_social_buzz.json")
+    price_receipts = _load(output_dir / "investible_price_receipts.json")
+    sentiment_current = _load(output_dir / "investible_sentiment_current.json")
+    sentiment_history = _load(output_dir / "investible_sentiment_history.json")
 
     signals = raw["signals"]
     accepted = [signal for signal in signals if signal.get("accepted_in_window") is True]
@@ -48,6 +53,12 @@ def audit(output_dir: Path) -> dict[str, object]:
     assert len(ledger["sources"]) == latest["source_ledger_count"]
     expected_topics = min(latest["top_n_requested"], latest.get("qualifying_social_cluster_count", latest["unique_topic_count"]))
     assert len(latest["topics"]) == expected_topics
+    assert latest["top_n_requested"] == 50
+    assert top50["run_id"] == latest["run_id"]
+    assert pre_run_scan.get("scan_status") in {"LIVE_PAGE_SCAN_OK", "LIVE_PAGE_SCAN_UNAVAILABLE"}
+    assert isinstance(price_receipts.get("receipts"), list)
+    assert sentiment_current.get("run_id") == latest["run_id"]
+    assert isinstance(sentiment_history, list) and sentiment_history
     assert all(topic.get("social_signal_count", 0) > 0 for topic in latest["topics"])
     assert "doctor" not in public
     assert "cookie" not in json.dumps(public, ensure_ascii=False).casefold()
@@ -106,6 +117,7 @@ def audit(output_dir: Path) -> dict[str, object]:
         if positive is not None or negative is not None:
             assert positive is not None and negative is not None
             assert positive + negative == 100
+        assert "NON_DIRECTIONAL" in item.get("sentiment_counts", {})
         rows = [row for row in retrieval_rows if row["investible_id"] == item["investible_id"]]
         live_rows = [row for row in rows if row["platform"] in retrieval_ledger.get("live_validated_platforms", [])]
         if item["coverage"] == "COVERAGE COMPLETE":
@@ -127,7 +139,9 @@ def audit(output_dir: Path) -> dict[str, object]:
         "unique_topic_count": len(clusters["clusters"]),
         "source_ledger_count": len(ledger["sources"]),
         "duplicate_urls_removed": duplicate_urls_removed,
-        "top30_deterministic": True,
+        "top50_deterministic": True,
+        "pre_run_scan_status": pre_run_scan.get("scan_status"),
+        "price_receipts": len(price_receipts.get("receipts", [])),
         "sentiment_retrieval_rows": len(retrieval_rows),
         "sentiment_posts": len(sentiment_post_rows),
         "source_integrity": "PASS",
