@@ -167,6 +167,8 @@ def create_audit(root: Path, site_root: Path, canonical_pdf: Path, output_pdf: P
         "verification_ledger.json",
         "buzz_mapping.json",
         "finalization_receipt.json",
+        "agent_audit_receipts.json",
+        "postdeploy_route_audit.json",
     ]
     for name in output_files:
         add_file(audit, f"VERBATIM OUTPUT ARTIFACT — {name}", root / "output" / name)
